@@ -106,11 +106,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "bootstrap.cmd setup 失败" }
 
       - name: 打印 Conan profile（诊断）
+        # 纯诊断：profile 要到 build 步骤才会被 detect，这里失败不应中断构建
+        continue-on-error: true
         working-directory: YesSteveModel-Native
         shell: pwsh
         run: |
           $env:CONAN_HOME = "$PWD\conan\cache"
           conan profile show -pr:h default 2>&1 | Tee-Object -FilePath ..\profile-log.txt
+          exit 0
 
       - name: 构建 native（编译 30 个依赖，首次较久）
         working-directory: YesSteveModel-Native
