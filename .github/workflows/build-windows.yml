@@ -48,19 +48,35 @@ jobs:
           where.exe cl
           cl 2>&1 | Select-Object -First 3
 
-      - name: 安装 NASM（缺失时）
+      - name: 准备 NASM（并移除 Yasm）
         shell: pwsh
         run: |
+          # GitHub runner 自带 yasm；native 文档要求 PATH 中不能有 Yasm。
+          # runner 是一次性的，这里直接移除它，而不是中断构建。
+          $yasm = Get-Command yasm -ErrorAction SilentlyContinue
+          if ($yasm) {
+            Write-Host "发现 Yasm：$($yasm.Source)，移除"
+            try {
+              Remove-Item -LiteralPath $yasm.Source -Force -ErrorAction Stop
+            } catch {
+              Rename-Item -LiteralPath $yasm.Source -NewName "yasm.disabled" -Force
+            }
+          }
+          if (Get-Command yasm -ErrorAction SilentlyContinue) { throw "Yasm 仍在 PATH 中" }
+          Write-Host "Yasm: 已移除"
+
+          # NASM：缺失则用 Chocolatey 安装
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
-            Write-Host "nasm 缺失，用 Chocolatey 安装"
+            Write-Host "NASM 缺失，用 Chocolatey 安装"
             choco install nasm -y --no-progress
-            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append
           }
-          $env:Path = "C:\Program Files\NASM;" + $env:Path
+          $nasmDir = "C:\Program Files\NASM"
+          if (Test-Path (Join-Path $nasmDir "nasm.exe")) {
+            $nasmDir | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append
+            $env:Path = "$nasmDir;" + $env:Path
+          }
           nasm -v
-          if (Get-Command yasm -ErrorAction SilentlyContinue) {
-            throw "PATH 中存在 Yasm，native 构建要求移除"
-          }
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) { throw "NASM 不可用" }
 
       - name: 安装 Conan（>= 2.28）
         shell: pwsh
