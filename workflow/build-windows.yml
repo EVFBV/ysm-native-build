@@ -1,15 +1,22 @@
 name: Build ysm.dll (Windows)
 
-# 目标：在 GitHub 托管的 Windows runner 上构建 YSM 的 native 库，
-# 产物 ysm.dll 用于打进模组 JAR，使玩家在 Windows 上开箱即用。
+# 目标：在 GitHub 托管的 Windows runner 上构建 YSM 的 native 库（ysm.dll），
+# 产物用于打进模组 JAR，使玩家在 Windows 上开箱即用。
 #
-# 说明：本仓库只包含这个 workflow，不包含任何私有源码；
-# 构建对象是公开仓库 YesSteveModel/YesSteveModel-Native。
+# 说明：
+#  - 本仓库只包含 CI 与脚本，不含任何私有源码；构建对象是公开仓库
+#    YesSteveModel/YesSteveModel-Native。
+#  - 官方 Windows 工具链是 clang-cl + lld；这里使用 runner 自带的 MSVC
+#    （项目的 core headers 已有 _MSC_VER 分支），只需为 gfx 中 2 处
+#    clang 专有的空 asm 编译器屏障补上 MSVC 分支。
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
+
+env:
+  CACHE_PREFIX: conan-win-v2
 
 jobs:
   build-windows-native:
@@ -24,6 +31,7 @@ jobs:
           Write-Host "== python =="; python --version
           Write-Host "== cmake ==";  cmake --version | Select-Object -First 1
           Write-Host "== ninja ==";  ninja --version
+          Write-Host "== cl ==";     (Get-Command cl -ErrorAction SilentlyContinue).Source
           Write-Host "== nasm ==";   (Get-Command nasm -ErrorAction SilentlyContinue).Source
           Write-Host "== yasm ==";   (Get-Command yasm -ErrorAction SilentlyContinue).Source
 
@@ -90,13 +98,52 @@ jobs:
           git clone --depth 1 https://github.com/YesSteveModel/YesSteveModel-Native
           Get-ChildItem YesSteveModel-Native | Select-Object -First 12 Name
 
-      - name: 缓存 Conan 包缓存（加速重试）
-        uses: actions/cache@v4
+      - name: 适配 MSVC：替换 clang 专有的编译器屏障
+        shell: pwsh
+        run: |
+          # gfx 里有 2 处 GCC/Clang 风格的空 asm 编译器屏障，MSVC 不支持该语法
+          # （error C2059）。项目的 core headers 本就有 _MSC_VER 分支，说明 MSVC
+          # 是被支持的，这里为这 2 处补上等价分支。
+          # 另 2 处 asm 位于 #ifdef YSM_ANDROID 的 AArch64 分支，Windows 下不编译。
+          $old1 = 'asm volatile("" : "+x"(table_low), "+x"(table_high));'
+          $new1 = (@(
+            '#if defined(_MSC_VER) && !defined(__clang__)',
+            '    _ReadWriteBarrier();',
+            '#else',
+            '    asm volatile("" : "+x"(table_low), "+x"(table_high));',
+            '#endif'
+          ) -join "`n")
+
+          $old2 = 'asm volatile("" : "+r"(back_face_bits));'
+          $new2 = (@(
+            '#if defined(_MSC_VER) && !defined(__clang__)',
+            '    _ReadWriteBarrier();',
+            '#else',
+            '    asm volatile("" : "+r"(back_face_bits));',
+            '#endif'
+          ) -join "`n")
+
+          $edits = @(
+            @{ File = 'YesSteveModel-Native\modules\gfx\src\math\euler.h'; Old = $old1; New = $new1 },
+            @{ File = 'YesSteveModel-Native\modules\gfx\src\renderer\cube\transform_avx2.h'; Old = $old2; New = $new2 }
+          )
+          foreach ($e in $edits) {
+            if (-not (Test-Path -LiteralPath $e.File)) { throw "文件不存在：$($e.File)" }
+            $text = Get-Content -Raw -LiteralPath $e.File
+            if (-not $text.Contains($e.Old)) { throw "未找到待替换内容（上游可能已改动）：$($e.File)" }
+            [System.IO.File]::WriteAllText($e.File, $text.Replace($e.Old, $e.New))
+            Write-Host "已适配：$($e.File)"
+          }
+          Write-Host "--- 校验替换结果 ---"
+          Select-String -Path 'YesSteveModel-Native\modules\gfx\src\math\euler.h','YesSteveModel-Native\modules\gfx\src\renderer\cube\transform_avx2.h' -Pattern '_ReadWriteBarrier' | ForEach-Object { Write-Host $_.Line.Trim() }
+
+      - name: 恢复 Conan 包缓存
+        uses: actions/cache/restore@v4
         with:
           path: YesSteveModel-Native\conan\cache
-          key: conan-win-${{ runner.os }}-${{ github.run_id }}
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}
           restore-keys: |
-            conan-win-${{ runner.os }}-
+            ${{ env.CACHE_PREFIX }}-
 
       - name: Conan 导出配方（bootstrap setup）
         working-directory: YesSteveModel-Native
@@ -106,7 +153,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "bootstrap.cmd setup 失败" }
 
       - name: 打印 Conan profile（诊断）
-        # 纯诊断：profile 要到 build 步骤才会被 detect，这里失败不应中断构建
         continue-on-error: true
         working-directory: YesSteveModel-Native
         shell: pwsh
@@ -150,6 +196,13 @@ jobs:
           path: YesSteveModel-Native/build/native-release/modules/lib-jni/ysm.dll
           if-no-files-found: error
           retention-days: 30
+
+      - name: 保存 Conan 包缓存（无论成败）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: YesSteveModel-Native\conan\cache
+          key: ${{ env.CACHE_PREFIX }}-${{ github.run_id }}
 
       - name: 上传日志（始终）
         if: always()
